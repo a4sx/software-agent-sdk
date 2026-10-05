@@ -9870,6 +9870,72 @@ class TestACPBridgeMasking:
         assert client.accumulated_text == ["the token is <secret-hidden>"]
 
     @pytest.mark.asyncio
+    async def test_secret_split_across_chunks_masked_in_live_relay(self):
+        """A model relaying a secret in prose streams it as sub-word chunks,
+        none of which matches the mask alone (OpenHands/OpenHands#15720)."""
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        registry = SecretRegistry()
+        registry.update_secrets({"BUILD_ID": "ZQXJV-77781-UNIQUEMARKER"})
+        client = _OpenHandsACPBridge()
+        client.mask = registry.mask_secrets_in_output
+        client.stream_mask = registry.compile_stream_mask
+        tokens: list[str] = []
+        client.on_token = tokens.append
+
+        # The tokenization observed live from codex-acp, wrapped in prose.
+        fragments = ["The identifier is ", "Z", "Q", "X", "JV", "-", "777", "81"]
+        fragments += ["-", "UNI", "QU", "EM", "ARK", "ER", " - done."]
+        for text in fragments:
+            chunk = MagicMock(spec=AgentMessageChunk)
+            chunk.content = MagicMock(spec=TextContentBlock)
+            chunk.content.text = text
+            await client.session_update("sess-1", chunk)
+        client.flush_token_relay()
+
+        # Had any raw fragment been relayed, the concatenation would carry it.
+        assert "".join(tokens) == "The identifier is <secret-hidden> - done."
+
+    @pytest.mark.asyncio
+    async def test_live_relay_holds_back_only_a_possible_secret_tail(self):
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        registry = SecretRegistry()
+        registry.update_secrets({"TOKEN": "abc"})
+        client = _OpenHandsACPBridge()
+        client.mask = registry.mask_secrets_in_output
+        client.stream_mask = registry.compile_stream_mask
+        tokens: list[str] = []
+        client.on_token = tokens.append
+
+        chunk = MagicMock(spec=AgentMessageChunk)
+        chunk.content = MagicMock(spec=TextContentBlock)
+        chunk.content.text = "hello world"
+        await client.session_update("sess-1", chunk)
+
+        # At most len("abc") - 1 characters wait for the next chunk.
+        assert tokens == ["hello wor"]
+        client.flush_token_relay()
+        assert tokens == ["hello wor", "ld"]
+
+    def test_reset_drops_held_relay_tail(self):
+        """A retried turn re-streams from the start; its old tail is stale."""
+        registry = SecretRegistry()
+        registry.update_secrets({"TOKEN": "abc"})
+        registry.get_secret_value("TOKEN")
+        client = _OpenHandsACPBridge()
+        client.stream_mask = registry.compile_stream_mask
+        tokens: list[str] = []
+        client.on_token = tokens.append
+
+        client._relay_token("xy")
+        client.reset()
+        client.on_token = tokens.append
+        client.flush_token_relay()
+
+        assert tokens == []
+
+    @pytest.mark.asyncio
     async def test_thought_chunk_masked(self):
         from acp.schema import AgentThoughtChunk, TextContentBlock
 
@@ -10121,6 +10187,42 @@ class TestACPStepMasksPersistedTurn:
         )
         assert "supersecret" not in finish.action.message
         assert finish.action.message == "the value is <secret-hidden> now"
+
+    def test_live_tokens_mask_secret_split_across_chunks(self, tmp_path):
+        from acp.schema import AgentMessageChunk, TextContentBlock
+
+        agent = _make_agent()
+        conversation = self._make_conversation_with_message(tmp_path)
+        reg = conversation.state.secret_registry
+        reg.update_secrets({"TOKEN": "supersecret"})
+        reg.get_secret_value("TOKEN")
+        tokens: list[str] = []
+
+        mock_client = _OpenHandsACPBridge()
+        mock_client.mask = reg.mask_secrets_in_output
+        mock_client.stream_mask = reg.compile_stream_mask
+        agent._client = mock_client
+        agent._conn = MagicMock()
+        agent._session_id = "test-session"
+
+        async def _stream() -> None:
+            for text in ["the value is su", "pers", "ecret now"]:
+                chunk = MagicMock(spec=AgentMessageChunk)
+                chunk.content = MagicMock(spec=TextContentBlock)
+                chunk.content.text = text
+                await mock_client.session_update("test-session", chunk)
+
+        def _fake_run_async(_coro, **_kwargs):
+            asyncio.run(_stream())
+
+        mock_executor = MagicMock()
+        mock_executor.run_async = _fake_run_async
+        agent._executor = mock_executor
+
+        agent.step(conversation, on_event=lambda _: None, on_token=tokens.append)
+
+        # The held-back tail is released when the turn finishes.
+        assert "".join(tokens) == "the value is <secret-hidden> now"
 
 
 class TestPreconfiguredCredentials:

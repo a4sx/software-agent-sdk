@@ -151,7 +151,10 @@ if TYPE_CHECKING:
         ConversationTokenCallbackType,
         LocalConversation,
     )
-    from openhands.sdk.conversation.secret_registry import SecretRegistry
+    from openhands.sdk.conversation.secret_registry import (
+        SecretRegistry,
+        StreamOutputMask,
+    )
 # Maximum seconds to wait for a UsageUpdate notification after prompt()
 # returns. The ACP server writes UsageUpdate to the wire before the
 # PromptResponse, so under normal conditions the notification handler
@@ -1309,6 +1312,15 @@ class _OpenHandsACPBridge:
         # injected credential never lands in the (persisted, network-relayed)
         # event stream in cleartext. ``None`` ⇒ no-op (bridge used standalone).
         self.mask: Callable[[str], str] | None = None
+        # Streaming masker factory for the live ``on_token`` relay — bound
+        # with ``mask`` to ``state.secret_registry.compile_stream_mask``.
+        # ``mask`` sees one chunk at a time, so a secret the server streams
+        # split across chunks would pass it in pieces; the per-turn masker
+        # holds back a tail that could still grow into a secret until the
+        # next chunk (or ``flush_token_relay``) settles it. ``None`` ⇒ chunks
+        # are relayed as soon as ``mask`` has seen them.
+        self.stream_mask: Callable[[], StreamOutputMask] | None = None
+        self._token_mask: StreamOutputMask | None = None
         self.before_mask: Callable[[], None] | None = None
         self._masking_error: CredentialBindingError | None = None
         self._last_activity_signal: float = float("-inf")
@@ -1338,6 +1350,8 @@ class _OpenHandsACPBridge:
         self.on_token = None
         self.on_event = None
         self.on_activity = None
+        # A retried turn re-streams from the start, so the old tail is dropped.
+        self._token_mask = None
         self._turn_usage_updates.clear()
         self._usage_received.clear()
         self._masking_error = None
@@ -1403,6 +1417,38 @@ class _OpenHandsACPBridge:
             logger.debug("secret masking failed", exc_info=True)
             return value
 
+    def _relay_token(self, text: str) -> None:
+        """Hand a masked text chunk to ``on_token``, holding back a split secret.
+
+        The stream masker is compiled on the turn's first chunk, after
+        ``_mask_value`` has resolved the registry's values.
+        """
+        if self.on_token is None:
+            return
+        if self.stream_mask is not None:
+            if self._token_mask is None:
+                self._token_mask = self.stream_mask()
+            text = self._token_mask.feed(text)
+            if not text:
+                return
+        try:
+            self.on_token(text)
+        except Exception:
+            logger.debug("on_token callback failed", exc_info=True)
+
+    def flush_token_relay(self) -> None:
+        """Release the tail the live relay held back; the turn's text is done."""
+        masker, self._token_mask = self._token_mask, None
+        if masker is None or self.on_token is None:
+            return
+        held = masker.flush()
+        if not held:
+            return
+        try:
+            self.on_token(held)
+        except Exception:
+            logger.debug("on_token callback failed", exc_info=True)
+
     def _mask_tool_call_entry(self, entry: dict[str, Any]) -> None:
         """Mask title / raw_input / raw_output / content of a tool-call entry.
 
@@ -1454,16 +1500,14 @@ class _OpenHandsACPBridge:
             if isinstance(update.content, TextContentBlock):
                 # Mask once, then use the masked chunk for both the persisted
                 # accumulation and the live ``on_token`` relay. A secret split
-                # across two chunks slips through here (each piece alone won't
-                # match); the joined response is re-masked at the persistence
-                # boundary in ``_finalize_successful_turn`` to catch that.
+                # across chunks slips past the per-chunk mask (each piece alone
+                # won't match): the relay holds back a possible partial secret
+                # until the next chunk settles it, and the joined response is
+                # re-masked at the persistence boundary in
+                # ``_finalize_successful_turn``.
                 text = self._mask_value(update.content.text)
                 self.accumulated_text.append(text)
-                if self.on_token is not None:
-                    try:
-                        self.on_token(text)
-                    except Exception:
-                        logger.debug("on_token callback failed", exc_info=True)
+                self._relay_token(text)
             self._maybe_signal_activity()
         elif isinstance(update, AgentThoughtChunk):
             if isinstance(update.content, TextContentBlock):
@@ -2921,6 +2965,7 @@ class ACPAgent(AgentBase):
         # session updates AND for ask_agent() forks, which run on the shared
         # client and may fire while no step()/astep() turn is active.
         client.mask = state.secret_registry.mask_secrets_in_output
+        client.stream_mask = state.secret_registry.compile_stream_mask
         self._bind_file_credential_masking()
 
         # Build the subprocess environment. Precedence, highest first:
@@ -3752,6 +3797,10 @@ class ACPAgent(AgentBase):
         # server opened but never terminated so every ``started`` has its
         # matching terminal observation before the turn's FinishAction lands.
         self._flush_inflight_tool_calls_as_completed()
+
+        # The server has sent all of this turn's text: release the tail the
+        # live relay held back, before the stream's slot is claimed below.
+        self._client.flush_token_relay()
 
         # Re-mask the joined text at this persistence boundary: the chunks were
         # already masked individually as they streamed, but a secret split
